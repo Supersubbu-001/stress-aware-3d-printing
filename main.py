@@ -98,7 +98,6 @@ def build_pipeline(stress_csv: str, stl_path: str, output_path: str):
     bounds = processor.geometry['bounds']
     generator = InfillGenerator(config)
     infill_layers = generator.build_adaptive_infill(bounds, blend_density, layer_count=12)
-    infill_layers = generator.build_layer_script(infill_layers)
 
     gcode_gen = GCodeGenerator(config)
     infill_layers = gcode_gen.build_layer_commands(infill_layers)
@@ -125,7 +124,7 @@ def run_interactive():
 if __name__ == '__main__':
     try:
         output_path = run_interactive()
-        print(f"\nCreated G-code at: {output_path}")
+        print(f"\n✅ Created G-code at: {output_path}")
         print("Pipeline complete.")
     except Exception as exc:
         logger.exception("Pipeline failed")
