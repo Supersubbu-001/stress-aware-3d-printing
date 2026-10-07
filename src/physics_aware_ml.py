@@ -1,68 +1,50 @@
 #!/usr/bin/env python3
-"""Main entry point for stress-aware 3D printing pipeline."""
+"""Physics-aware ML model for adaptive infill optimization."""
 
-import argparse
-from pathlib import Path
-
-from src.input_processor import InputProcessor
-from src.stress_analyzer import StressAnalyzer
-from src.physics_aware_ml import PhysicsAwareMLModel
-from src.infill_generator import InfillGenerator
-from src.gcode_generator import GCodeGenerator
-from src.utils import load_config, ensure_directory, get_logger
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from .utils import get_logger
 
 logger = get_logger(__name__)
 
 
-def build_pipeline(stress_csv: str, stl_path: str, output_path: str):
-    config = load_config('config.yaml')
+class PhysicsAwareMLModel:
+    """Simple physics-aware surrogate model for mapping stress to infill density."""
 
-    processor = InputProcessor()
-    processor.load_stress_csv(stress_csv)
-    processor.load_geometry_stl(stl_path)
-    alignment = processor.align_stress_to_mesh()
+    def __init__(self, config):
+        self.config = config
+        self.model = RandomForestRegressor(
+            n_estimators=50,
+            random_state=42,
+            max_depth=8,
+        )
+        logger.info("Physics-aware surrogate model initialized")
 
-    stress_values = alignment['stress_per_vertex']
-    stress_summary = StressAnalyzer(config).compute_density_map(stress_values)
+    def fit(self, X, y):
+        self.model.fit(X, y)
+        return self
 
-    # Optional surrogate physics-aware ML densification
-    geometry_features = [
-        [1.0, 0.5, 0.25, 0.1] for _ in range(len(stress_values))
-    ]
-    ml_model = PhysicsAwareMLModel(config)
-    adaptive_density = ml_model.predict(stress_values, geometry_features)
+    def predict(self, stress_values, geometry_features=None):
+        stress = np.asarray(stress_values, dtype=float).ravel()
+        if stress.size == 0:
+            return np.array([], dtype=float)
 
-    # Blend direct stress density and ML density
-    blend_density = 0.6 * stress_summary + 0.4 * adaptive_density
-    blend_density = blend_density.astype(float)
+        if geometry_features is None:
+            geom = np.zeros((len(stress), 4))
+        else:
+            geom = np.asarray(geometry_features, dtype=float)
+            if geom.shape[0] != len(stress):
+                geom = np.tile(np.array([1.0, 0.5, 0.25, 0.1], dtype=float), (len(stress), 1))
 
-    # Generate adaptive infill layers
-    bounds = processor.geometry['bounds']
-    generator = InfillGenerator(config)
-    infill_layers = generator.build_adaptive_infill(bounds, blend_density, layer_count=12)
-    infill_layers = generator.build_layer_script(infill_layers)
+        features = np.column_stack([
+            stress,
+            np.clip(geom[:, 0], 0, 1),
+            np.clip(geom[:, 1], 0, 1),
+            np.clip(geom[:, 2], 0, 1),
+        ])
 
-    # Convert to G-code
-    gcode_gen = GCodeGenerator(config)
-    infill_layers = gcode_gen.build_layer_commands(infill_layers)
-    output_file = output_path or 'data/outputs/stress_aware_part.gcode'
-    ensure_directory(Path(output_file).parent)
-    gcode_gen.generate(infill_layers, output_file)
-
-    logger.info('Pipeline complete. Generated adaptive G-code: %s', output_file)
-    return output_file
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Stress-aware 3D printing adaptive infill generator')
-    parser.add_argument('--stress-data', required=True, help='ANSYS stress CSV file')
-    parser.add_argument('--geometry', required=True, help='STL geometry file')
-    parser.add_argument('--output', default='data/outputs/stress_aware_part.gcode', help='Output G-code path')
-    return parser.parse_args()
-
-
-if __name__ == '__main__':
-    args = parse_args()
-    build_pipeline(args.stress_data, args.geometry, args.output)
-    print(f'Created G-code at: {args.output}')
-    print('Pipeline complete.')
+        max_stress = np.max(stress) if stress.size else 1.0
+        rule_based = 10 + (stress / (max_stress + 1e-8)) * 90
+        correction = self.model.predict(features)
+        final = 0.7 * rule_based + 0.3 * np.clip(correction, 10, 100)
+        return np.clip(final, 10, 100)
