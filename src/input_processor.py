@@ -1,227 +1,132 @@
-"""Input processor for ANSYS stress data (CSV) and STL geometry."""
+#!/usr/bin/env python3
+"""Main entry point for stress-aware 3D printing pipeline."""
 
-import numpy as np
-import pandas as pd
-import trimesh
 from pathlib import Path
-from .utils import get_logger
+import sys
+
+from src.input_processor import InputProcessor
+from src.stress_analyzer import StressAnalyzer
+from src.physics_aware_ml import PhysicsAwareMLModel
+from src.infill_generator import InfillGenerator
+from src.gcode_generator import GCodeGenerator
+from src.utils import load_config, ensure_directory, get_logger
 
 logger = get_logger(__name__)
 
 
-class InputProcessor:
-    """Process ANSYS stress CSV and STL geometry files."""
+def get_file_path(prompt, file_type="file"):
+    """Get file path from user with validation."""
+    while True:
+        file_path = input(f"\n{prompt}: ").strip()
+        if not file_path:
+            print("❌ Path cannot be empty. Please try again.")
+            continue
 
-    def __init__(self):
-        self.stress_data = None
-        self.geometry = None
-        self.mesh = None
+        path = Path(file_path)
+        if not path.exists():
+            print(f"❌ {file_type.capitalize()} not found: {file_path}")
+            continue
 
-    def load_stress_csv(self, csv_path):
-        """Load ANSYS stress data from CSV or tab-delimited text file."""
-        logger.info(f"Loading stress data from {csv_path}")
+        if file_type == "file" and not path.is_file():
+            print(f"❌ Path is not a file: {file_path}")
+            continue
 
-        try:
-            # Detect delimiter automatically
-            with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
-                first_line = f.readline()
+        if file_type == "directory" and not path.is_dir():
+            print(f"❌ Path is not a directory: {file_path}")
+            continue
 
-            delimiter = '\t' if '\t' in first_line else ','
-            logger.info(f"Detected delimiter: {delimiter!r}")
+        return str(path.resolve())
 
-            df = pd.read_csv(csv_path, sep=delimiter)
-            df.columns = [str(col).strip() for col in df.columns]
-            logger.info(f"Loaded {len(df)} stress data points")
-            logger.info(f"CSV columns: {df.columns.tolist()}")
 
-            # Try to locate columns dynamically for different ANSYS export styles
-            normalized_cols = {str(col).strip().lower(): col for col in df.columns}
+def get_output_path(prompt):
+    """Get output file path from user."""
+    while True:
+        value = input(f"\n{prompt}: ").strip()
+        if not value:
+            print("❌ Output path cannot be empty.")
+            continue
 
-            node_col = (
-                normalized_cols.get('node_id') or
-                normalized_cols.get('node number') or
-                normalized_cols.get('node') or
-                normalized_cols.get('node number ') or
-                None
-            )
+        path = Path(value)
+        ensure_directory(path.parent)
 
-            x_col = (
-                normalized_cols.get('x') or
-                normalized_cols.get('x location (mm)') or
-                normalized_cols.get('x location') or
-                normalized_cols.get('x coordinate') or
-                None
-            )
-            y_col = (
-                normalized_cols.get('y') or
-                normalized_cols.get('y location (mm)') or
-                normalized_cols.get('y location') or
-                normalized_cols.get('y coordinate') or
-                None
-            )
-            z_col = (
-                normalized_cols.get('z') or
-                normalized_cols.get('z location (mm)') or
-                normalized_cols.get('z location') or
-                normalized_cols.get('z coordinate') or
-                None
-            )
-            stress_col = (
-                normalized_cols.get('stress_mpa') or
-                normalized_cols.get('stress') or
-                normalized_cols.get('equivalent (von-mises) stress (mpa)') or
-                normalized_cols.get('equivalent von-mises stress (mpa)') or
-                normalized_cols.get('equivalent stress (mpa)') or
-                None
-            )
+        if path.exists():
+            overwrite = input(f"⚠️ File already exists: {path}. Overwrite? (yes/no): ").strip().lower()
+            if overwrite not in ("y", "yes"):
+                print("Please choose a different path.")
+                continue
 
-            # Fallback if column names don't match exactly
-            if x_col is None:
-                for col in df.columns:
-                    if 'x' in col.lower() and 'location' in col.lower():
-                        x_col = col
-                        break
-            if y_col is None:
-                for col in df.columns:
-                    if 'y' in col.lower() and 'location' in col.lower():
-                        y_col = col
-                        break
-            if z_col is None:
-                for col in df.columns:
-                    if 'z' in col.lower() and 'location' in col.lower():
-                        z_col = col
-                        break
-            if stress_col is None:
-                for col in df.columns:
-                    if 'stress' in col.lower() or 'von' in col.lower():
-                        stress_col = col
-                        break
+        return str(path.resolve())
 
-            required = [x_col, y_col, z_col, stress_col]
-            if any(col is None for col in required):
-                raise ValueError(
-                    f"Could not identify required columns. Available columns: {df.columns.tolist()}"
-                )
 
-            node_values = df[node_col].values if node_col else np.arange(len(df))
+def get_training_choice():
+    choice = input("\nDo you want to use a separate CSV for ML training? (yes/no): ").strip().lower()
+    if choice in ("y", "yes"):
+        return get_file_path("Enter path to training CSV file")
+    return None
 
-            self.stress_data = {
-                'coordinates': df[[x_col, y_col, z_col]].values.astype(float),
-                'stress': df[stress_col].astype(float).values,
-                'node_ids': node_values,
-                'strain': np.zeros(len(df), dtype=float),
-                'raw_df': df
-            }
 
-            logger.info(
-                f"Stress range: {self.stress_data['stress'].min():.2f} - {self.stress_data['stress'].max():.2f} MPa"
-            )
-            return self.stress_data
+def build_pipeline(stress_csv: str, stl_path: str, output_path: str):
+    config = load_config('config.yaml')
 
-        except Exception as e:
-            logger.error(f"Error loading stress CSV: {e}")
-            raise
+    processor = InputProcessor()
+    processor.load_stress_csv(stress_csv)
+    processor.load_geometry_stl(stl_path)
+    alignment = processor.align_stress_to_mesh()
 
-    def load_geometry_stl(self, stl_path):
-        """Load 3D geometry from STL file."""
-        logger.info(f"Loading geometry from {stl_path}")
+    stress_values = alignment['stress_per_vertex']
+    stress_map = StressAnalyzer(config)
+    direct_density = stress_map.compute_density_map(stress_values)
 
-        try:
-            mesh = trimesh.load(stl_path)
-            logger.info(f"Loaded mesh with {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    ml_model = PhysicsAwareMLModel(config)
+    train_csv = get_training_choice()
+    if train_csv:
+        train_processor = InputProcessor()
+        train_processor.load_stress_csv(train_csv)
+        train_stress = train_processor.stress_data['stress']
+        train_density = stress_map.compute_density_map(train_stress)
+    else:
+        train_stress = stress_values
+        train_density = direct_density
 
-            if not getattr(mesh, 'is_watertight', True):
-                logger.warning("Mesh is not watertight, attempting repair...")
+    ml_model.train(train_stress, train_density)
+    geometry_features = [[1.0, 0.5, 0.25, 0.1] for _ in range(len(stress_values))]
+    adaptive_density = ml_model.predict(stress_values, geometry_features)
 
-            self.mesh = mesh
-            self.geometry = {
-                'vertices': mesh.vertices,
-                'faces': mesh.faces,
-                'mesh': mesh,
-                'bounds': mesh.bounds,
-                'center': mesh.center_mass,
-                'volume': mesh.volume
-            }
+    blend_density = 0.6 * direct_density + 0.4 * adaptive_density
+    blend_density = blend_density.astype(float)
 
-            logger.info(f"Geometry bounds: {self.geometry['bounds']}")
-            logger.info(f"Part volume: {self.geometry['volume']:.2f} mm³")
-            return self.geometry
+    bounds = processor.geometry['bounds']
+    generator = InfillGenerator(config)
+    infill_layers = generator.build_adaptive_infill(bounds, blend_density, layer_count=12)
 
-        except Exception as e:
-            logger.error(f"Error loading STL file: {e}")
-            raise
+    gcode_gen = GCodeGenerator(config)
+    infill_layers = gcode_gen.build_layer_commands(infill_layers)
+    output_file = output_path or 'data/outputs/stress_aware_part.gcode'
+    ensure_directory(Path(output_file).parent)
+    gcode_gen.generate(infill_layers, output_file)
 
-    def validate_inputs(self):
-        """Validate that both stress data and geometry are loaded."""
-        if self.stress_data is None:
-            raise ValueError("Stress data not loaded. Call load_stress_csv() first.")
-        if self.geometry is None:
-            raise ValueError("Geometry not loaded. Call load_geometry_stl() first.")
+    logger.info('Pipeline complete. Generated adaptive G-code: %s', output_file)
+    return output_file
 
-        logger.info("Both stress data and geometry validated successfully")
-        return True
 
-    def align_stress_to_mesh(self):
-        """Align stress data to mesh vertices using nearest neighbor."""
-        if not self.validate_inputs():
-            return None
+def run_interactive():
+    print("\n" + "=" * 70)
+    print("STRESS-AWARE 3D PRINTING PIPELINE")
+    print("=" * 70)
 
-        logger.info("Aligning stress data to mesh vertices...")
+    stress_csv = get_file_path("Enter path to stress CSV file")
+    stl_path = get_file_path("Enter path to STL file")
+    output_path = get_output_path("Enter path to save the final G-code file")
 
-        from scipy.spatial import cKDTree
+    return build_pipeline(stress_csv, stl_path, output_path)
 
-        stress_coords = self.stress_data['coordinates']
-        mesh_vertices = self.geometry['vertices']
 
-        tree = cKDTree(mesh_vertices)
-        distances, indices = tree.query(stress_coords, k=1)
-
-        vertex_stress = np.zeros(len(mesh_vertices))
-        vertex_count = np.zeros(len(mesh_vertices))
-
-        for idx, stress_val in zip(indices, self.stress_data['stress']):
-            vertex_stress[idx] += stress_val
-            vertex_count[idx] += 1
-
-        valid = vertex_count > 0
-        vertex_stress[valid] /= vertex_count[valid]
-        vertex_stress[~valid] = np.mean(self.stress_data['stress'])
-
-        logger.info(f"Mapped stress to {np.sum(valid)} mesh vertices")
-
-        return {
-            'stress_per_vertex': vertex_stress,
-            'alignment_distances': distances,
-            'alignment_indices': indices
-        }
-
-    def get_stress_statistics(self):
-        """Get statistics of loaded stress data."""
-        if self.stress_data is None:
-            raise ValueError("Stress data not loaded")
-
-        stress = self.stress_data['stress']
-        return {
-            'min': np.min(stress),
-            'max': np.max(stress),
-            'mean': np.mean(stress),
-            'std': np.std(stress),
-            'median': np.median(stress),
-            'q25': np.percentile(stress, 25),
-            'q75': np.percentile(stress, 75),
-            'points': len(stress)
-        }
-
-    def get_geometry_statistics(self):
-        """Get statistics of loaded geometry."""
-        if self.geometry is None:
-            raise ValueError("Geometry not loaded")
-
-        return {
-            'vertices': len(self.geometry['vertices']),
-            'faces': len(self.geometry['faces']),
-            'volume': self.geometry['volume'],
-            'bounds': self.geometry['bounds'].tolist(),
-            'center': self.geometry['center'].tolist(),
-            'is_watertight': self.mesh.is_watertight
-        }
+if __name__ == '__main__':
+    try:
+        output_path = run_interactive()
+        print(f"\n✅ Created G-code at: {output_path}")
+        print("Pipeline complete.")
+    except Exception as exc:
+        logger.exception("Pipeline failed")
+        print(f"\n❌ Pipeline failed: {exc}")
+        sys.exit(1)
