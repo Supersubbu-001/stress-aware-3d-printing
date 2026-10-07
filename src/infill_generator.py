@@ -1,59 +1,61 @@
-"""
-Physics-aware ML model abstraction for adaptive infill optimization
-"""
+"""Adaptive infill generation for variable density patterns."""
 
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
 from .utils import get_logger
 
 logger = get_logger(__name__)
 
 
-class PhysicsAwareMLModel:
-    """Simple physics-aware surrogate model for mapping stress to infill density."""
+class InfillGenerator:
+    """Generate adaptive infill pattern based on density field."""
 
     def __init__(self, config):
         self.config = config
-        self.model = None
-        self._build_model()
+        self.layer_height = config['print']['layer_height']
+        self.nozzle_diameter = config['printer']['nozzle_diameter']
 
-    def _build_model(self):
-        # A lightweight deterministic surrogate approximates a physics-aware rule based model.
-        self.model = RandomForestRegressor(
-            n_estimators=50,
-            random_state=42,
-            max_depth=8,
-        )
-        logger.info("Physics-aware surrogate model initialized")
+    def build_adaptive_infill(self, mesh_bounds, density_map, layer_count=10):
+        """Create a simplified adaptive infill field over the bounding box."""
+        min_x, min_y, min_z = mesh_bounds[0]
+        max_x, max_y, max_z = mesh_bounds[1]
 
-    def fit(self, X, y):
-        self.model.fit(X, y)
-        return self
+        density_map = np.asarray(density_map, dtype=float)
+        if density_map.size == 0:
+            density_map = np.array([50.0])
 
-    def predict(self, stress_values, geometry_features=None):
-        stress = np.asarray(stress_values, dtype=float)
-        if stress.ndim == 0:
-            stress = np.array([float(stress)])
+        if layer_count <= 0:
+            layer_count = max(1, int(np.ceil(max_z / self.layer_height)))
 
-        if geometry_features is None:
-            geometry_features = np.zeros((len(stress), 4))
-        geom = np.asarray(geometry_features, dtype=float)
-        if geom.shape[0] != len(stress):
-            geom = np.tile(np.array([1.0, 0.5, 0.25, 0.1], dtype=float), (len(stress), 1))
+        infill_layers = []
+        for z in np.linspace(min_z, max_z, num=layer_count):
+            x_coords = np.linspace(min_x, max_x, num=20)
+            y_coords = np.linspace(min_y, max_y, num=20)
+            density_factor = float(np.mean(density_map)) / 100.0
+            spacing = max(2.0, 12.0 - density_factor * 8.0)
 
-        features = np.column_stack([
-            stress,
-            np.clip(geom[:, 0], 0, 1),
-            np.clip(geom[:, 1], 0, 1),
-            np.clip(geom[:, 2], 0, 1),
-        ])
+            layer_lines = []
+            for y in y_coords:
+                line = []
+                for x in x_coords:
+                    line.append((x, y, z))
+                layer_lines.append(line)
 
-        # Heuristic blend: physics-based stress rules with learned forest correction
-        rule_based = 10 + stress / (np.max(stress) + 1e-6) * 90
-        if self.model is not None:
-            correction = self.model.predict(features)
-            final = 0.7 * rule_based + 0.3 * np.clip(correction, 10, 100)
-        else:
-            final = rule_based
+            if z % (2 * self.layer_height) < self.layer_height:
+                layer_lines = [list(reversed(line)) for line in layer_lines]
 
-        return np.clip(final, 10, 100)
+            infill_layers.append({'z': z, 'lines': layer_lines, 'spacing': spacing})
+
+        logger.info(f"Generated adaptive infill for {layer_count} layers")
+        return infill_layers
+
+    def generate_layer_script(self, layer_data, start_x=0.0, start_y=0.0):
+        """Return a list of G1 commands for one layer."""
+        commands = []
+        for line in layer_data['lines']:
+            if len(line) == 0:
+                continue
+            start = line[0]
+            end = line[-1]
+            commands.append(f"G1 X{start[0]:.3f} Y{start[1]:.3f} Z{start[2]:.3f} F1200")
+            commands.append(f"G1 X{end[0]:.3f} Y{end[1]:.3f} Z{start[2]:.3f} E0.5 F900")
+        return commands
